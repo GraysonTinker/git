@@ -1,6 +1,7 @@
 #define USE_THE_REPOSITORY_VARIABLE
 
 #include "git-compat-util.h"
+#include "advice.h"
 #include "commit.h"
 #include "config.h"
 #include "date.h"
@@ -480,11 +481,6 @@ static int verify_ssh_signed_buffer(struct signature_check *sigc,
 		.local = 1,
 	};
 
-	if (!ssh_allowed_signers) {
-		error(_("gpg.ssh.allowedSignersFile needs to be configured and exist for ssh signature verification"));
-		return -1;
-	}
-
 	buffer_file = mks_tempfile_t(".git_vtag_tmpXXXXXX");
 	if (!buffer_file)
 		return error_errno(_("could not create temporary file"));
@@ -500,22 +496,26 @@ static int verify_ssh_signed_buffer(struct signature_check *sigc,
 		strbuf_addf(&verify_time, "-Overify-time=%s",
 			show_date(sigc->payload_timestamp, 0, verify_date_mode));
 
-	/* Find the principal from the signers */
-	strvec_pushl(&ssh_keygen.args, fmt->program,
-		     "-Y", "find-principals",
-		     "-f", ssh_allowed_signers,
-		     "-s", buffer_file->filename.buf,
-		     verify_time.buf,
-		     NULL);
-	ret = pipe_command(&ssh_keygen, NULL, 0, &ssh_principals_out, 0,
-			   &ssh_principals_err, 0);
-	if (ret && strstr(ssh_principals_err.buf, "usage:")) {
-		error(_("ssh-keygen -Y find-principals/verify is needed for ssh signature verification (available in openssh version 8.2p1+)"));
-		goto out;
+	if (ssh_allowed_signers) {
+		/* Find the principal from the signers */
+		strvec_pushl(&ssh_keygen.args, fmt->program,
+				"-Y", "find-principals",
+				"-f", ssh_allowed_signers,
+				"-s", buffer_file->filename.buf,
+				verify_time.buf,
+				NULL);
+		ret = pipe_command(&ssh_keygen, NULL, 0, &ssh_principals_out, 0,
+				&ssh_principals_err, 0);
+		if (ret && strstr(ssh_principals_err.buf, "usage:")) {
+			error(_("ssh-keygen -Y find-principals/verify is needed for ssh signature verification (available in openssh version 8.2p1+)"));
+			goto out;
+		}
 	}
-	if (ret || !ssh_principals_out.len) {
+
+	if (!ssh_allowed_signers || ret || !ssh_principals_out.len) {
 		/*
-		 * We did not find a matching principal in the allowedSigners
+		 * We did not find a matching principal in the allowedSigners,
+		 * or no allowedSigners file was configured
 		 * Check without validation
 		 */
 		child_process_init(&ssh_keygen);
@@ -527,6 +527,10 @@ static int verify_ssh_signed_buffer(struct signature_check *sigc,
 			     NULL);
 		pipe_command(&ssh_keygen, sigc->payload, sigc->payload_len,
 				   &ssh_keygen_out, 0, &ssh_keygen_err, 0);
+
+		if (!ssh_allowed_signers) {
+			advise(_("Configure gpg.ssh.allowedSignersFile for automatic principal matching\n"));
+		}
 
 		/*
 		 * Fail on unknown keys
